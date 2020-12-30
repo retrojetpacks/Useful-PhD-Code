@@ -1,0 +1,496 @@
+'''Functions to run population sysnthesis models'''
+
+from __future__ import division
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import time
+import astrophysical_constants_cgs as c
+
+Q_crit = 1.4 #Lodato & Rice 2005
+
+#Nayakshin & Fletcher 2015
+#alpha0 = 1.e-3#4
+alpha_sg = 0.12 #normalisation for self-grav alpha
+
+t_GImax = 1e5*c.sec_per_year
+t_max  = 1e7*c.sec_per_year  #how far to integrate equations
+#t_disp = c.sec_per_year*5e5 #disc dispersal time
+t_acc  = 1e50*c.sec_per_year  #planet accretion time
+eta = 100.#For the Malik+15 opening gap condition
+
+plot_cols = ['#2EC4C6','#FFC82E','#CD6622','#FF1493','#440044','#6a5acd','#33cc33','#0055ff','#dd44cc','#cd6622','#A8CFFF','#62D0FF']
+
+
+
+
+#============ Define analytic disc properties ============#
+
+def calc_analytic_disc(t,A,M_P,args0):
+    '''Calculate analytic disc properties
+    A[cm], M[g]'''
+    M_star0  = args0['M_star0']
+    M_disc0  = args0['M_disc0']
+    Rin      = args0['Rin']
+    Rout     = args0['Rout']
+    T100     = args0['T100']
+    t_disp   = args0['t_disp'] * c.sec_per_year
+    alpha0   = args0['alpha0']
+
+    M_disc = M_disc0 * np.exp(-t/t_disp)
+    M_star = M_star0 + M_disc0*(1 - np.exp(-t/t_disp))
+    
+    T    = T100 * (A/(100*c.AU))**-0.5
+    cs   = np.sqrt(c.kb*T/c.mu/c.mp)
+    HtoR = np.sqrt(c.kb*T*A / (c.mu*c.mp*c.G*M_star))
+    H    = A*HtoR
+    Om_K = np.sqrt(c.G*M_star/A**3)
+    
+    Sig0 = M_disc / (2*np.pi*(Rout-Rin))
+    Sig  = Sig0 * (1/A)
+    Q    = cs*Om_K / (np.pi*c.G*Sig)
+    Qout = Q * (Rout/A)**(-3/4)
+    RH   = A * (M_P/(3*M_star))**(1/3)
+    
+    return M_disc,M_star,T,cs,HtoR,H,Om_K,Sig,Q,Qout,RH
+
+
+def load_allona_data(file1):
+    '''Load data from Allona's clump evolution simulations'''
+    folder = 'Allona_Jupiters/'
+    data = np.genfromtxt(folder+file1,skip_header=3)
+    
+    Time  = data[:,1]*c.sec_per_year #Years
+    Tc    = data[:,2]                #K
+    Rho_c = data[:,6]                #g/cm^3 
+    R_P   = data[:,7]*c.Rsol         #cm
+    L     = data[:,12]               #Solar L
+
+    return Time,Tc,Rho_c,R_P,L
+
+
+def migrate(t,A,M_P,args0,Model):
+    '''Perform one migration time step'''
+
+    M_disc,M_star,T,cs,HtoR,H,Om_K,Sig,Q,Qout,RH = calc_analytic_disc(t,A,M_P,args0)
+    alpha0 = args0['alpha0']
+    typeI = True
+    Md = np.pi * Sig * A**2
+    if Model == 'NayakshinFletcher15':
+        alpha = alpha0 + alpha_sg * Q_crit**2/(Q_crit**2 + Q**2)
+        Crida_p = 0.75*H/RH + 50.*alpha*HtoR**2 * M_star/M_P
+        if Crida_p > 1:
+            t_migr = 1/Om_K * M_star**2/(M_P * Md) * HtoR**2 #type I
+        else:
+            typeI = False
+            t_migr = 1./(alpha*Om_K*HtoR**2) * (1. + M_P/Md) #type II
+
+    elif Model == 'Mueller+18':
+        #This describes alpha_self_grav after Kratter,Matzner,Krumholz+08
+        if Qout < 2.:
+            alpha_sh = 0.14*(1.3**2/Qout**2 - 1.)*(1. - M_disc/M_star)**1.15
+            if (alpha_sh < 0.):
+                alpha_sh = 0.
+            alpha_long = 1.4e-3*(2. - Q)*(M_star/M_disc)**1.25/Qout**0.5
+            if (alpha_long < 0.):
+                alpha_long = 0.
+            alpha = alpha0 + (alpha_sh**2 + alpha_long**2)**0.5
+        else:
+            alpha = alpha0
+        
+        #Baruteau+11 migration
+        t_migr = 5.6/(4.8)*2.*np.pi/Om_K*(5/3)*Q*HtoR**3*(M_star/M_P)*(0.1/HtoR)**2
+        Crida_p = 0.75*H/RH + 50.*alpha*HtoR**2 * M_star/M_P
+        if (Crida_p < 1.):
+            #Malik+15 gap migration
+            t_cross = 2.5*RH/A*t_migr
+            t_gap = 1./Om_K * (M_star/M_P)**2 * HtoR**5
+            if (t_cross > eta * t_gap):
+                typeI = False
+                t_migr = 1./(alpha*Om_K*HtoR**2) * (1. + M_P/Md)
+                
+        
+    elif (Model == 'ForganRice13'):
+        if (M_P < 2.* M_star*HtoR**3):
+            t_migr = 1/Om_K * M_star/(M_P) *HtoR #type I
+        else:
+            t_migr = 1./(alpha0*Om_K*HtoR**2) * (1. + M_P/Md) #type II
+            typeI = False
+        
+    t_migr_min = 5.*2.*np.pi/Om_K
+    if (t_migr < t_migr_min): t_migr = t_migr_min
+    dt = 0.05 * t_migr
+    if (dt > 1.e5*c.sec_per_year): dt = 1.e5*c.sec_per_year
+    A = A * np.exp(-dt/t_migr)
+    if typeI == True:
+        M_P = M_P * np.exp(dt/t_acc)
+    t = t + dt
+
+    return t,A,M_P,RH,T
+
+
+
+def solve_migration(args0):
+    '''Solve migration tracks'''
+    
+    #==== Initialise storage lists ====#
+    Model = args0['Model']
+    t     = args0['t0'] #sec
+    A     = args0['A0']
+    M_P   = args0['M_P0']
+    RH    = A * (M_P/(3*args0['M_star0']))**(1/3)
+    ts,As,M_Ps,R_Ps,RHs,Phases = [t],[A],[M_P],[0],[RH],[1]
+    tau = t
+    RP_mode = args0['RP_mode']
+    
+    #==== Load Allona dataset ====#
+    if RP_mode != 'None':
+        file1  = 'poutsum_'+str(int(args0['M_P0']/c.MJ))+'Mj_clmpev_isol_tmp'
+        try:
+            eTime,eTc,eRho_c,eR_P,eL = load_allona_data(file1)
+            R_Ps[0] = eR_P[0]
+        except:
+            RP_mode = 'None'
+            print 'Clump evolution data not available for this planet mass'
+
+
+    #================ Run main migration loop ================#
+    while (t < t_max) and (A > args0['Rin']):
+        t,A,M_P,RH,T_mid = migrate(t,A,M_P,args0,Model)
+
+        #==== Check if phase ii collapse has occured ====#
+        if RP_mode != 'None':
+            if t < eTime[-1]:
+                phase = 1
+                ind = np.argmin((eTime-t)**2)
+                R_P = eR_P[ind]
+                if RP_mode == 'thermal_bath':
+                    dt   = t-ts[-1]
+                    tau  = tau + dt * ((1 - (4*np.pi*R_P**2*c.sigma_SB*T_mid**4))/ (eL[ind]*c.Lsol))
+                    ind2 = np.argmin((eTime-tau)**2)
+                    R_P = eR_P[ind2]
+            #Model has collapsed to phase ii
+            else:
+                phase = 2
+                R_P = c.RJ
+        else:
+            phase,R_P = 1,c.RJ
+
+        #==== Check if tidal disruption has occured ir Rp > RH/3====#
+        if R_P > RH*2/3:
+                #print 'Clump disrupted!'
+                t = t_max
+                A = -1
+
+        #==== Update save lists ====#
+        ts.append(t)
+        As.append(A)
+        M_Ps.append(M_P)
+        R_Ps.append(R_P)
+        RHs.append(RH)
+        Phases.append(phase)
+        
+
+    #==== Export data for complete evolution track ====#
+    ts     = np.asarray(ts)/c.sec_per_year #Years
+    As     = np.asarray(As)/c.AU  #AU
+    M_Ps   = np.asarray(M_Ps)/c.ME #ME
+    R_Ps   = np.asarray(R_Ps)/c.AU #AU
+    RHs    = np.asarray(RHs)/c.AU  #AU
+    Phases = np.asarray(Phases)
+
+    return ts, As, M_Ps, R_Ps, RHs, Phases
+
+
+
+def run_models(params):
+    '''Run three comparison models'''
+    #==== Initial system parameters ====#
+    M_tot = c.Msol #Total system mass
+    q0 = 0.1       #Initial disc/star mass ratio
+
+    args0 = {}
+    args0['M_star0'] = (1-q0)*M_tot #g
+    args0['M_disc0'] = q0*M_tot     #g
+    args0['Rin']     = 0.1*c.AU     #cm
+    args0['Rout']    = 150*c.AU     #cm
+    args0['T100']    = 20           #K
+    args0['A0']      = 100*c.AU     #cm
+    args0['M_P0']    = 7*c.MJ  #10*c.ME #g
+    args0['RP_mode'] = 'thermal_bath'
+    args0['alpha0']  = 1e-3
+    args0['t_disp']  = 5e5
+    args0['t0']      = 1 #Years
+    Models = ['NayakshinFletcher15','Mueller+18','ForganRice13']
+
+
+    #==== Plotting code ====#
+    fig1 = plt.figure(facecolor='w')
+    if len(params) == 1:
+        ax1 = fig1.add_axes([0.15,0.1,0.8,0.8])
+        axes = [ax1]
+    elif len(params) == 2:
+        ax1 = fig1.add_axes([0.15,0.55,0.8,0.37])
+        ax2 = fig1.add_axes([0.15,0.1,0.8,0.37],sharex=ax1)
+        axes = [ax1,ax2]
+
+    for i in range(len(Models)):
+        args0['Model'] = Models[i]
+        ts,As,M_Ps,R_Ps,RHs,Phases = solve_migration(args0)
+        print 'N steps', len(ts)
+        inds1 = np.where(Phases==1)
+        inds2 = np.where(Phases==2)
+
+        for j in range(len(axes)):
+            if params[j] == 'A':
+                axes[j].plot(ts[inds1],As[inds1],label=Models[i],color=plot_cols[i])
+                axes[j].plot(ts[inds2],As[inds2],ls='--',color=plot_cols[i])
+                axes[j].set_ylim(0.1,150)
+                axes[j].set_ylabel('R [AU]')
+                if i == 0:
+                    axes[j].semilogy()
+                    axes[j].plot([],[],ls='--',color=plot_cols[i],label='Phase 2')
+                    
+
+            elif params[j] == 'R_P':
+                axes[j].plot(ts,R_Ps,color=plot_cols[i],label=r'R_P')
+                axes[j].plot(ts,RHs/3,ls='--',color=plot_cols[i],label=r'R$_H$/3')
+                if i == 0:
+                    axes[j].legend(frameon=False)
+                axes[j].set_ylabel(r'R$_P$ [AU]')
+
+            elif params[j] == 'M_P':
+                axes[j].plot(ts,M_Ps,color=plot_cols[i])
+                axes[j].set_ylabel('M [ME]')
+
+    ax1.set_xlim(10,t_max*1.1/c.sec_per_year)
+    axes[-1].set_xlabel('Time [Years]')
+    ax1.semilogx()
+    ax1.legend(frameon=False)
+    ax1.text(0,1.05,r'M$_P$ = ' + str(args0['M_P0']/c.MJ)+r' M$_J$  '
+             + r'M$_{disc}$ = ' + str(args0['M_disc0']/c.Msol) + r' M$_{\odot}$',
+             transform=ax1.transAxes)
+    return
+
+
+def plot_allona_data():
+    files = [
+        'poutsum_1Mj_clmpev_isol_tmp',
+        'poutsum_3Mj_clmpev_isol_tmp',
+        'poutsum_5Mj_clmpev_isol_tmp',
+        'poutsum_7Mj_clmpev_isol_tmp',
+        ]
+
+    fig1 = plt.figure(11,facecolor='white',figsize=(8,10))
+    ax1 = fig1.add_axes([0.2,0.74,0.75,0.22])
+    ax2 = fig1.add_axes([0.2,0.52,0.75,0.22],sharex=ax1)
+    ax3 = fig1.add_axes([0.2,0.3,0.75,0.22],sharex=ax1)
+    ax4 = fig1.add_axes([0.2,0.08,0.75,0.22],sharex=ax1)
+    axes = [ax1,ax2,ax3,ax4]
+
+    #==== Loop over Allona's 4 test cases ====#
+    for i in range(len(files)):
+        r_label = files[i].split('sum_')[1].split('_')[0]
+        Time,Tc,Rho_c,R_P,L = load_allona_data(files[i])
+        Time = Time/c.sec_per_year
+        ax1.plot(Time,Tc,label=r_label)
+        ax2.plot(Time,Rho_c)
+        ax3.plot(Time,R_P/c.AU)
+        ax4.plot(Time,L)
+
+    ax1.set_ylabel('Tc [K]')
+    ax2.set_ylabel(r'$\rho_c$ [gcm$^{-3}$]')
+    ax3.set_ylabel(r'R$_P$ [AU]')
+    ax4.set_ylabel(r'L [L$_\odot$]')
+    ax4.set_xlabel('Time [Years]')
+    ax1.semilogx()
+    ax1.semilogy()
+    ax2.semilogy()
+    ax3.semilogy()
+    ax4.semilogy()
+
+    ax1.legend(frameon=False)
+
+    
+
+def exoplanets_org():
+    '''Construct a histogram of exoplanets.org Juipters'''
+    fname = 'Exoplanet Primary.csv'
+    data = np.genfromtxt(fname,skip_header=1,delimiter=',')
+    print np.shape(data)
+    M_P    = data[:,19][data[:,20]>0]
+    A      = data[:,20][data[:,20]>0]
+    M_star = data[:,50]
+    MP_edges = [0.5,5,13]
+
+    #plt.figure(0)
+    #plt.hist(M_P)
+    
+    plt.figure(1)
+    bins     = np.logspace(-2,2.3,50) #Radial bins
+    for i in range(len(MP_edges)-1):
+        inds = np.where((M_P>MP_edges[i]) & (M_P<MP_edges[i+1]))[0]
+        weights = np.ones(len(inds))*100/len(A)
+        plt.hist(A[inds],bins=bins,alpha=0.15,label='Exoplanets.org: '+str(MP_edges[i])+'-'+str(MP_edges[i+1]),
+                 weights=weights,color=plot_cols[i+1])
+    plt.semilogx()
+    plt.legend(frameon=False)
+
+    return
+
+
+
+def histogram(params,col=plot_cols[0],lw=1,ls='-',label=''):
+    '''Construct and plot one population histogram'''
+
+    #==== Load parameters ====#
+    Models   = params['Models']
+    MPs      = params['MPs']
+    RP_modes = params['RP_modes']
+    qs       = params['qs']
+    M_stars  = params['M_stars']
+    R_outs   = params['R_outs']
+    A0s      = params['A0s']
+    t_disps  = params['t_disps']
+    alpha0s  = params['alpha0s']
+    NPs      = params['NPs'][0]
+    init     = params['init']
+
+    t0s = 0.#np.arange(0,t_GImax,t_GImax/NPs) #sec
+    
+    #==== Build 1D arrays with all parameter combinations ====#
+    mModels,mMPs,mRP_modes,mqs,mM_stars,mR_outs,mA0s,mt_disps,malpha0s,mt0s = np.meshgrid(
+        Models,MPs,RP_modes,qs,M_stars,R_outs,A0s,t_disps,alpha0s,t0s,indexing='ij')
+    mModels   = np.ravel(mModels)
+    mMPs      = np.ravel(mMPs)
+    mRP_modes = np.ravel(mRP_modes)
+    mqs       = np.ravel(mqs)
+    mM_stars  = np.ravel(mM_stars)
+    mR_outs   = np.ravel(mR_outs)
+    mA0s      = np.ravel(mA0s)
+    mt_disps  = np.ravel(mt_disps)
+    malpha0s  = np.ravel(malpha0s)
+    mt0s      = np.ravel(mt0s)
+
+    N_combi   = len(mqs)    #Number of parameter combinations
+    Ais = np.zeros(N_combi) #Store for initial separations
+    Afs = np.zeros(N_combi) #Store for final separations
+
+    
+    #==== Build init condition dictionary ====#
+    args0 = {}
+    args0['Rin']     = 0.01*c.AU     #cm
+    args0['T100']    = 20           #K
+
+    for i in range(N_combi):
+        if i%1000 == 0:
+            print 'i',i
+        M_tot = mM_stars[i]*c.Msol #g Total system mass
+        args0['Model']   = mModels[i]
+        args0['M_star0'] = (1-mqs[i])*M_tot           #g
+        args0['M_disc0'] = mqs[i]*M_tot               #g
+        args0['Rout']    = mR_outs[i]*c.AU            #cm
+        args0['A0']      = mR_outs[i]*c.AU * mA0s[i]  #cm
+        args0['M_P0']    = mMPs[i]*c.MJ                    #g
+        args0['RP_mode'] = mRP_modes[i]
+        args0['t_disp']  = mt_disps[i]
+        args0['alpha0']  = malpha0s[i]
+        args0['t0']      = mt0s[i]
+        
+        ts,As,M_Ps,R_Ps,RHs,Phases = solve_migration(args0)
+        Ais[i] = As[0]
+        Afs[i] = As[-1]
+
+    #======== Plotting code ========#
+    bin_in   = np.log10(args0['Rin']/c.AU/2)
+    bins     = np.logspace(bin_in,2.3,40) #Radial bins
+    weightsi  = np.ones(len(Ais))*100/N_combi #Normalise to 100% = initial population
+    weightsf  = np.ones(len(Afs))*100/N_combi #Normalise to 100% = initial population
+
+    #==== Plot initial histogram ====#
+    if init == True:
+        plt.hist(Ais,bins=bins,facecolor=plot_cols[0],alpha=0.2,label='Initial distribution',weights=weightsi)
+
+    #==== Plot output histogram ====#
+    survive = len(Afs[Afs>0.05])/len(Afs)
+    label += ' Survive: {:.2f}'.format(survive*100)+'%'
+    plt.hist(Afs,bins=bins,label=label,histtype='step',lw=lw,ls=ls,color=col,alpha=0.8,weights=weightsf)
+    plt.legend(frameon=False)
+    return
+            
+
+
+def abundance():
+    masses    = np.array([50,10,2,1.5,1,0.7,0.2])
+    lifetime  = np.array([10,100,1000,3000,10000,50000,200000])
+    abundance = np.array([1e-5,0.1,0.7,2,3.5,8,80])
+    l_a = lifetime/abundance
+    l_a = l_a / np.sum(l_a)*100
+    plt.scatter(masses,l_a)
+    plt.semilogx()
+    plt.semilogy()
+
+    return
+
+
+
+def hist_grid():
+    '''Build an array of histograms for each experimental variable'''
+    lws = [1,2,3,1,4]
+    lss = ['-','--',':','-.','-']
+
+    
+    #==== Define parameter ranges ====#
+    Ndim    = 7
+    params = {
+#        'Models':   ['Mueller+18'],#'NayakshinFletcher15'],#,[
+ #       'Models':   ['ForganRice13'],
+        'Models':   ['NayakshinFletcher15'],
+        'MPs':      [7], #MJ
+        'RP_modes': ['thermal_bath'],#'Allona','thermal_bath'],
+        'qs':       np.linspace(0.1,0.25,Ndim), #disc/stellar fraction
+        'M_stars':  np.linspace(0.7,1.3,4), #Msol
+        'R_outs':   np.linspace(70,120,4),  #AU
+        'A0s':      [1],#np.linspace(0.7,1,3),  #initial orbit as fraction of Rout
+        't_disps':  np.logspace(5.5,6.5,Ndim), #Years
+        'alpha0s':  np.logspace(-3.3,-2,Ndim),#[1e-3],#,3e-4,1e-3],#
+        'NPs':      [1], #Number of planets per system. Only works as experimental atm
+        'init':     True
+    }
+
+    #==== Set experimental variables ====#
+    var1 = 'MPs'
+    var2 = 'Models'#'NPs'#'RP_modes'#'t_disps'#'alpha0s'
+
+    for i in range(len(params[var1])):
+        for j in range(len(params[var2])):
+            run_params = params.copy()
+            run_params[var1] = [params[var1][i]]
+            run_params[var2] = [params[var2][j]]
+            label =  ' '#'q: '+str(params['qs'][0])+' '
+            label += var1[:-1]+': '+str(params[var1][i])+' '
+            label += var2[:-1]+': '+str(params[var2][j])
+            
+            histogram(run_params,col=plot_cols[i],lw=lws[j],ls=lss[j],label=label)
+            params['init'] = False
+
+            
+    plt.xlabel('Orbit [AU]')
+    plt.ylabel('Percentage of systems')
+    plt.semilogx()
+    plt.yscale('log', nonposy='clip')
+
+    return 
+
+
+if __name__ == '__main__':
+    
+    #run_models(params=['A','R_P']) #'M_P'
+    #plot_allona_data()
+    #abundance()
+
+    hist_grid() 
+    exoplanets_org()
+    
+
+    plt.show()

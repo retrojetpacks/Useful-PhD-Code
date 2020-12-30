@@ -1,0 +1,6 @@
+#!/bin/sh
+
+CFLAGS='-Wall -O0 -g' python setup.py build_ext
+#python setup.py build_ext
+python setup.py install --user
+python test.py

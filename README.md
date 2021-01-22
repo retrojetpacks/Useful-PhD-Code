@@ -1,5 +1,5 @@
 # Useful-PhD-Code
-A collction of python 2 modules that I wrote during my PhD, along with a few databases of observational protoplanet detections
+A collction of python 2 modules that I wrote during my PhD, along with observational data of protoplanet detections
 
 
 Obs data 
